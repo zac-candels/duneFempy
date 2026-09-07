@@ -10,7 +10,7 @@ import numpy as np
 import os
 
 WORKDIR = os.getcwd()
-outDirName = os.path.join(WORKDIR, "felb-finer")
+outDirName = os.path.join(WORKDIR, "felb-faster")
 os.makedirs(outDirName, exist_ok=True)
 
 import ufl
@@ -21,8 +21,8 @@ dt = 0.005
 numSteps = int(Tfinal/dt)
 L_x = 32
 L_y = 32
-nx = 13
-ny = 13
+nx = 12
+ny = 12
 h = min(L_x/nx, L_y/ny)
 
 forceDensity = np.array([2.6041666e-5, 0.0])
@@ -138,14 +138,7 @@ def fEquilInit(vel_idx, forceDensity):
 
 
 
-def f_equil(f_n, vel_idx, forceDensity):
-
-    density = sum(f_n)
-    
-    # Compute velocity at each DoF
-    velocity = getVel(f_n, forceDensity)
-
-    velSquared = ufl.inner(velocity, velocity)
+def f_equil(vel_idx, velocity, density, velSquared, forceDensity):
 
     # Compute ci . u for this direction
     c_dot_u = ufl.inner(velocity, xi[vel_idx])
@@ -211,6 +204,13 @@ linear_forms_collision = []
 
 opp_idx = {0: 0, 1: 3, 2: 4, 3: 1, 4: 2, 5: 7, 6: 8, 7: 5, 8: 6}
 
+density = getDens(f_n)
+velocity = getVel(f_n, forceDensity)
+
+velSquared = ufl.inner(velocity, velocity)
+
+f_equil = f_equil(0, velocity, density, velSquared, forceDensity)
+
 for idx in range(Q):
 
     bilinFormsStream.append(f_trial * v * ufl.dx)
@@ -229,7 +229,7 @@ for idx in range(Q):
         + double_dot_product_term\
         + dot_product_force_term
         
-    lin_form_coll = (f_n[idx] - dt/(tau) * (f_n[idx] - f_equil(f_n, idx, forceDensity)) )*v*ufl.dx
+    lin_form_coll = (f_n[idx] - dt/(tau) * (f_n[idx] - f_equil) )*v*ufl.dx
 
     linear_forms_stream.append(lin_form_idx)
     linear_forms_collision.append(lin_form_coll)
@@ -257,19 +257,21 @@ sysMatCollNumpy = sysMatColl[0].as_numpy
 collSolver = scipy.sparse.linalg.factorized(sysMatCollNumpy)
 
 streamSolvers = []
+f_nP1_arrays = []
+f_n_arrays = []
+f_star_arrays= []
 for idx in range(Q):
     sysMatStreamNumpy = sysMatStream[idx].as_numpy
     streamSolvers.append(scipy.sparse.linalg.factorized(sysMatStreamNumpy))
+    f_nP1_arrays.append(f_nP1[idx].as_numpy)
+    f_n_arrays.append(f_n[idx].as_numpy)
+    f_star_arrays.append(f_star[idx].as_numpy)
+    
 
 vel_expr = getVel(f_n, forceDensity)
 
 ux_expr = vel_expr[0]
 uy_expr = vel_expr[1]
-
-ux = V.interpolate(ux_expr, name="ux")    
-vtk = mesh.sequencedVTK(
-    "felb",
-    pointdata=[ux])
 
 y = ufl.SpatialCoordinate(V)[1]
         
@@ -282,6 +284,10 @@ u_exact = V.interpolate(
     name="u_exact"
 )
 
+ux = V.interpolate(0, name='ux')
+
+
+
 #%% Start time-stepping
 
 t = 0.0
@@ -289,14 +295,21 @@ print("about to enter time loop \n\n\n")
 for n in range(numSteps):
     t += dt
 
+    density = getDens(f_n)
+
+    velocity = getVel(f_n, forceDensity)
+
+    velSquared = ufl.inner(velocity, velocity)
 
     # Do collision
     for idx in range(Q):
+        c_dot_u = ufl.inner(xi[idx], velocity)
+        f_equil = w[idx] * density * (1 + 3*c_dot_u + 4.5*c_dot_u**2 - 1.5*velSquared)
         rhsVecCollision[idx] = dune.fem.assemble(linear_forms_collision[idx])
         
         b = rhsVecCollision[idx].as_numpy 
         
-        f_star[idx].as_numpy[:] = collSolver(b)
+        f_star_arrays[idx][:] = collSolver(b)
 
         
     for idx in range(Q):
@@ -309,7 +322,7 @@ for n in range(numSteps):
             b = rhsVecStreaming[idx].as_numpy
             
             sysMatStreamNumpy = sysMatStream[idx].as_numpy
-            f_nP1[idx].as_numpy[:] = streamSolvers[idx](b)
+            f_nP1_arrays[idx][idx] = streamSolvers[idx](b)
             
             
         elif (idx==4) or (idx == 7) or (idx==8):
@@ -321,14 +334,14 @@ for n in range(numSteps):
             b = rhsVecStreaming[idx].as_numpy
             
             sysMatStreamNumpy = sysMatStream[idx].as_numpy
-            f_nP1[idx].as_numpy[:] = streamSolvers[idx](b)
+            f_nP1_arrays[idx][:] = streamSolvers[idx](b)
             
             
         else:
             rhsVecStreaming[idx] = (dune.fem.assemble(linear_forms_stream[idx]))
             b = rhsVecStreaming[idx].as_numpy
             sysMatStreamNumpy = sysMatStream[idx].as_numpy
-            f_nP1[idx].as_numpy[:] = streamSolvers[idx](b)
+            f_nP1_arrays[idx][:] = streamSolvers[idx](b)
         
         # if idx == 2:
         #     print(
@@ -389,7 +402,6 @@ for n in range(numSteps):
         
         #ux = V.interpolate(ux_expr, name="ux")
         #uy = V.interpolate(uy_expr, name="uy")
-        vtk()
         
         nu_lbm = tau / 3.0
 
