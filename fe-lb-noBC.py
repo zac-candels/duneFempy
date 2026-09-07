@@ -10,19 +10,19 @@ import numpy as np
 import os
 
 WORKDIR = os.getcwd()
-outDirName = os.path.join(WORKDIR, "felb-finer")
+outDirName = os.path.join(WORKDIR, "felb")
 os.makedirs(outDirName, exist_ok=True)
 
 import ufl
 
 Q = 9
 Tfinal = 1500
-dt = 0.005
+dt = 0.01
 numSteps = int(Tfinal/dt)
 L_x = 32
 L_y = 32
-nx = 13
-ny = 13
+nx = 10
+ny = 10
 h = min(L_x/nx, L_y/ny)
 
 forceDensity = np.array([2.6041666e-5, 0.0])
@@ -125,7 +125,7 @@ def getVel(f_n, forceDensity):
 def fEquilInit(vel_idx, forceDensity):
     
     vel_0 = -dune.ufl.Constant( (forceDensity[0]*dt/(2*rho_init),
-                               forceDensity[1]*dt/(2*rho_init)) )
+                               forceDensity[1]*dt/2*rho_init) )
     
     c = xi[vel_idx]
     c_dot_u = ufl.inner(c, vel_0)
@@ -138,21 +138,19 @@ def fEquilInit(vel_idx, forceDensity):
 
 
 
-def f_equil(f_n, vel_idx, forceDensity):
-
+def f_equil(f_n, vel_idx, forceDensity, wallMask=None):
     density = sum(f_n)
-    
+
     # Compute velocity at each DoF
     velocity = getVel(f_n, forceDensity)
 
+    if wallMask is not None:
+        velocity = velocity * wallMask   # forces velocity -> 0 on wall DoFs
+
     velSquared = ufl.inner(velocity, velocity)
-
-    # Compute ci . u for this direction
     c_dot_u = ufl.inner(velocity, xi[vel_idx])
-
     feq = w[vel_idx] * density * (1 + 3*c_dot_u + 4.5*c_dot_u**2 - 1.5*velSquared)
-
-    return feq  
+    return feq
 
 
 
@@ -199,6 +197,11 @@ topFn = V.interpolate(
 
 bottomDoFs = np.where(bottomFn.as_numpy != 0)[0]
 topDoFs = np.where(topFn.as_numpy != 0)[0]
+
+wallMask = V.interpolate(
+    1.0 - bottomFn - topFn,
+    name="wallMask"
+)
     
 
 #%% Define linear and bilinear forms
@@ -229,7 +232,7 @@ for idx in range(Q):
         + double_dot_product_term\
         + dot_product_force_term
         
-    lin_form_coll = (f_n[idx] - dt/(tau) * (f_n[idx] - f_equil(f_n, idx, forceDensity)) )*v*ufl.dx
+    lin_form_coll = (f_n[idx] - dt/(tau) * (f_n[idx] - f_equil(f_n, idx, forceDensity, wallMask))) * v * ufl.dx
 
     linear_forms_stream.append(lin_form_idx)
     linear_forms_collision.append(lin_form_coll)
@@ -240,13 +243,13 @@ sysMatColl = []
 rhs_vec_streaming = [0]*Q
 rhs_vec_collision = [0]*Q
 for idx in range(Q):
-    #sysMatStream.append(dune.fem.assemble(bilinFormsStream[idx]))
-    if (idx == 0) or (idx == 1) or (idx == 3):
-        sysMatStream.append(dune.fem.assemble(bilinFormsStream[idx]))
-    elif (idx == 5) or (idx == 2) or (idx == 6):
-        sysMatStream.append(dune.fem.assemble([bilinFormsStream[idx], dbcBottom]))
-    elif (idx== 4) or (idx == 7) or (idx == 8) :
-        sysMatStream.append(dune.fem.assemble([bilinFormsStream[idx], dbcTop]))
+    sysMatStream.append(dune.fem.assemble(bilinFormsStream[idx]))
+    #if (idx == 0) or (idx == 1) or (idx == 3):
+    #    sysMatStream.append(dune.fem.assemble(bilinFormsStream[idx]))
+    #elif (idx == 5) or (idx == 2) or (idx == 6):
+    #    sysMatStream.append(dune.fem.assemble([bilinFormsStream[idx], dbcBottom]))
+    #elif (idx== 4) or (idx == 7) or (idx == 8) :
+    #    sysMatStream.append(dune.fem.assemble([bilinFormsStream[idx], dbcTop]))
         
     sysMatColl.append(dune.fem.assemble(bilinFormsColl[idx]))
  
@@ -282,6 +285,11 @@ u_exact = V.interpolate(
     name="u_exact"
 )
 
+xi_arr = np.array([[0,0],[1,0],[0,1],[-1,0],[0,-1],
+                    [1,1],[-1,1],[-1,-1],[1,-1]], dtype=float)
+
+wallDoFs = np.concatenate([bottomDoFs, topDoFs])
+
 #%% Start time-stepping
 
 t = 0.0
@@ -290,85 +298,39 @@ for n in range(numSteps):
     t += dt
 
 
-    # Do collision
+    f_vals = np.array([f_n[idx].as_numpy for idx in range(Q)])   # shape (Q, n_dofs)
+
+    rho = f_vals.sum(axis=0)
+    ux = (xi_arr[:, 0, None] * f_vals).sum(axis=0) / rho + forceDensity[0]*dt/(2*rho)
+    uy = (xi_arr[:, 1, None] * f_vals).sum(axis=0) / rho + forceDensity[1]*dt/(2*rho)
+
+    # Enforce zero velocity at wall DoFs before it's used in feq
+    ux[wallDoFs] = 0.0
+    uy[wallDoFs] = 0.0
+
+    cu = xi_arr[:, 0, None]*ux + xi_arr[:, 1, None]*uy   # shape (Q, n_dofs)
+    u2 = ux**2 + uy**2
+
+    feq = w[:, None] * rho * (1 + 3*cu + 4.5*cu**2 - 1.5*u2)
+
+    f_star_np = f_vals - (dt/tau) * (f_vals - feq)
+
     for idx in range(Q):
-        rhsVecCollision[idx] = dune.fem.assemble(linear_forms_collision[idx])
-        
-        b = rhsVecCollision[idx].as_numpy 
-        
-        f_star[idx].as_numpy[:] = collSolver(b)
+        f_star[idx].as_numpy[:] = f_star_np[idx, :]
 
         
     for idx in range(Q):
-        
-        if (idx==2) or (idx==5) or (idx==6):
-            rhsVecStreaming[idx] = (dune.fem.assemble(linear_forms_stream[idx]))
-            rhsVecStreaming[idx].as_numpy[bottomDoFs]\
-                = f_star[opp_idx[idx]].as_numpy[bottomDoFs]
+        rhsVecStreaming[idx] = (dune.fem.assemble(linear_forms_stream[idx]))
+        #rhsVecStreaming[idx].as_numpy[bottomDoFs]\
+        #    = f_star[opp_idx[idx]].as_numpy[bottomDoFs]
+            
+        #rhsVecStreaming[idx].as_numpy[topDoFs]\
+        #        = f_star[opp_idx[idx]].as_numpy[topDoFs]
                 
-            b = rhsVecStreaming[idx].as_numpy
-            
-            sysMatStreamNumpy = sysMatStream[idx].as_numpy
-            f_nP1[idx].as_numpy[:] = streamSolvers[idx](b)
-            
-            
-        elif (idx==4) or (idx == 7) or (idx==8):
-            rhsVecStreaming[idx] = (dune.fem.assemble(linear_forms_stream[idx]))
-            
-            rhsVecStreaming[idx].as_numpy[topDoFs]\
-                    = f_star[opp_idx[idx]].as_numpy[topDoFs]
-                    
-            b = rhsVecStreaming[idx].as_numpy
-            
-            sysMatStreamNumpy = sysMatStream[idx].as_numpy
-            f_nP1[idx].as_numpy[:] = streamSolvers[idx](b)
-            
-            
-        else:
-            rhsVecStreaming[idx] = (dune.fem.assemble(linear_forms_stream[idx]))
-            b = rhsVecStreaming[idx].as_numpy
-            sysMatStreamNumpy = sysMatStream[idx].as_numpy
-            f_nP1[idx].as_numpy[:] = streamSolvers[idx](b)
+        b = rhsVecStreaming[idx].as_numpy
         
-        # if idx == 2:
-        #     print(
-        #         "bottom bounceback error f2-f4:",
-        #         np.max(np.abs(
-        #             f_nP1[2].as_numpy[bottomDoFs]
-        #             - f_star[4].as_numpy[bottomDoFs]
-        #         ))
-        #     )
-
-        # if idx == 5:
-        #     print(
-        #         "bottom bounceback error f5-f7:",
-        #         np.max(np.abs(
-        #             f_nP1[5].as_numpy[bottomDoFs]
-        #             - f_star[7].as_numpy[bottomDoFs]
-        #         ))
-        #     )
-
-        # if idx == 6:
-        #     print(
-        #         "bottom bounceback error f6-f8:",
-        #         np.max(np.abs(
-        #             f_nP1[6].as_numpy[bottomDoFs]
-        #             - f_star[8].as_numpy[bottomDoFs]
-        #         ))
-        #     )
-            
-        # if idx == 4:
-        #     print(
-        #         "top bounceback error f4-f2:",
-        #         np.max(np.abs(
-        #             f_nP1[4].as_numpy[topDoFs]
-        #             - f_star[2].as_numpy[topDoFs]
-        #         ))
-        #     )
-                    
-    
-            
-            
+        sysMatStreamNumpy = sysMatStream[idx].as_numpy
+        f_nP1[idx].as_numpy[:] = streamSolvers[idx](b)
 
     # Update previous solutions
 
@@ -377,7 +339,7 @@ for n in range(numSteps):
         
     
     
-    if n % 1000 == 0:
+    if n % 100 == 0:
         
         
         print("\n\n n = ", n, "writing to file \n\n")
@@ -387,7 +349,7 @@ for n in range(numSteps):
         ux_expr = vel_expr[0]
         uy_expr = vel_expr[1]
         
-        #ux = V.interpolate(ux_expr, name="ux")
+        ux_fn = V.interpolate(ux_expr, name="ux")
         #uy = V.interpolate(uy_expr, name="uy")
         vtk()
         
@@ -406,22 +368,23 @@ for n in range(numSteps):
         
         
         vel_expr = getVel(f_n, forceDensity)
-        ux.interpolate(vel_expr[0])
+        #ux.interpolate(vel_expr[0])
         
+        ux_np = ux_fn.as_numpy
         
         print(
             f"n={n}, t={t:.4f}, "
-            f"max(ux)={np.max(ux.as_numpy):.12e}, "
-            f"min(ux)={np.min(ux.as_numpy):.12e}",
+            f"max(ux)={np.max(ux_np):.12e}, "
+            f"min(ux)={np.min(ux_np):.12e}",
             flush=True
         )
         
         mesh.writeVTK(
-            os.path.join(outDirName, f"ux_modBC_{n:06d}"),
-            pointdata=[ux]
+            os.path.join(outDirName, f"ux_noBC_{n:06d}"),
+            pointdata=[ux_fn]
         )
-        error = np.linalg.norm(u_exact_np - ux.as_numpy)
-        max_u = np.max(ux.as_numpy)
+        error = np.linalg.norm(u_exact_np - ux_np)
+        max_u = np.max(ux_np)
                 
                 
             
@@ -429,3 +392,4 @@ for n in range(numSteps):
     
     
     
+
