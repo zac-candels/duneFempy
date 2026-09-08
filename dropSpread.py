@@ -47,8 +47,8 @@ dgf_text = """\
 DGF
 Interval
 0.0 0.0
-32.0 32.0
-10 10
+16 4
+40 20
 #
 PERIODICFACETRANSFORMATION
 1 0, 0 1 + 32 0
@@ -223,6 +223,7 @@ topFn = V.interpolate(
 bottomDoFs = np.where(bottomFn.as_numpy != 0)[0]
 topDoFs = np.where(topFn.as_numpy != 0)[0]
     
+print("")
 
 #%% Define linear and bilinear forms
 
@@ -237,9 +238,14 @@ linear_forms_collision = []
 bilin_form_AC = phi_trial * v * ufl.dx
 bilin_form_mu = mu_trial * v * ufl.dx
 
-lin_form_AC = phi_n * v * ufl.dx - dt*v*ufl.dot(getVel(f_n, forceDensity), ufl.grad(phi_n))*ufl.dx\
+density = getDens(f_n)
+velocity_n = getVel(f_n, forceDensity)
+velStar_n = getVel(f_star, forceDensity)
+velSquared = ufl.inner(velocity_n, velocity_n)
+
+lin_form_AC = phi_n * v * ufl.dx - dt*v*ufl.dot(velocity_n, ufl.grad(phi_n))*ufl.dx\
     - dt*M_tilde*v*mu_n*ufl.dx - (beta_mass_diff/dt)*mass_diff*ufl.sqrt( ufl.dot(ufl.grad(phi_n), ufl.grad(phi_n)) )*v*ufl.dx\
-        - 0.5*dt**2 * ufl.dot(getVel(f_n, forceDensity), ufl.grad(v)) * ufl.dot(getVel(f_n, forceDensity), ufl.grad(phi_n)) *ufl.dx
+        - 0.5*dt**2 * ufl.dot(velocity_n, ufl.grad(v)) * ufl.dot(velocity_n, ufl.grad(phi_n)) *ufl.dx
 
 lin_form_mu =  A* phi_n*(phi_n**2 - 1)*v*ufl.dx\
     + kappa*ufl.dot(ufl.grad(phi_n),ufl.grad(v))*ufl.dx\
@@ -256,16 +262,23 @@ for idx in range(Q):
         * ufl.inner(xi[idx], ufl.grad(v)) * ufl.dx
 
     dot_product_force_term = 0.5*dt**2 * ufl.inner(xi[idx], ufl.grad(v))\
-        * body_Force(getVel(f_star, forceDensity), idx, forceDensity) * ufl.dx
+        * body_Force(velStar_n, idx, forceDensity) * ufl.dx
 
 
     lin_form_idx = f_star[idx]*v*ufl.dx\
         - dt*v*ufl.inner(xi[idx], ufl.grad(f_star[idx]))*ufl.dx\
-        + dt*v*body_Force(getVel(f_star, forceDensity), idx, forceDensity)*ufl.dx\
+        + dt*v*body_Force(velStar_n, idx, forceDensity)*ufl.dx\
         + double_dot_product_term\
         + dot_product_force_term
         
-    lin_form_coll = (f_n[idx] - dt/(tau) * (f_n[idx] - f_equil(f_n, idx, forceDensity)) )*v*ufl.dx
+    f_eq_idx = f_equil(
+        idx,
+        velocity_n,
+        density,
+        velSquared,
+        forceDensity)
+        
+    lin_form_coll = (f_n[idx] - dt/(tau) * (f_n[idx] - f_eq_idx) )*v*ufl.dx
 
     linear_forms_stream.append(lin_form_idx)
     linear_forms_collision.append(lin_form_coll)
@@ -293,10 +306,16 @@ sysMatCollNumpy = sysMatColl[0].as_numpy
 collSolver = scipy.sparse.linalg.factorized(sysMatCollNumpy)
 
 streamSolvers = []
+f_nP1_arrays = []
+f_n_arrays = []
+f_star_arrays= []
 for idx in range(Q):
     sysMatStreamNumpy = sysMatStream[idx].as_numpy
     streamSolvers.append(scipy.sparse.linalg.factorized(sysMatStreamNumpy))
-
+    f_nP1_arrays.append(f_nP1[idx].as_numpy)
+    f_n_arrays.append(f_n[idx].as_numpy)
+    f_star_arrays.append(f_star[idx].as_numpy)
+    
 vel = V_vec.interpolate(dune.ufl.Constant((0,0)), name="vel")    
 
 
@@ -307,14 +326,20 @@ for n in range(numSteps):
     rhs_mu = ufl.assemble(lin_form_mu)
 
 
+    density = getDens(f_n)
+
+    velocity = getVel(f_n, forceDensity)
+
+    velSquared = ufl.inner(velocity, velocity)
+    
     # Do collision
     for idx in range(Q):
         rhsVecCollision[idx] = dune.fem.assemble(linear_forms_collision[idx])
         
         b = rhsVecCollision[idx].as_numpy 
         
-        f_star[idx].as_numpy[:] = collSolver(b)
-
+        f_star_arrays[idx][:] = collSolver(b)
+        
         
     for idx in range(Q):
         
