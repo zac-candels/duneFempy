@@ -96,8 +96,8 @@ f_nP1 = []
 initFn = V.interpolate(0, "initFn")
 for idx in range(Q):
     #f_n.append( V.interpolate(0, "f_n{}".format(idx) ) )
-    f_star.append( initFn.copy(name=f"f_star{idx}") )
-    f_nP1.append( initFn.copy(name=f"f_nP1{idx}") )
+    f_star.append( initFn.copy() )
+    f_nP1.append( initFn.copy() )
 
 x = ufl.SpatialCoordinate(V)
 
@@ -174,8 +174,7 @@ def body_Force(vel, vel_idx, Force_density):
 for idx in range(Q):
     print("idx = ", idx)
     f_n.append( V.interpolate(
-        fEquilInit(idx, forceDensity),
-        name=f"f_n{idx}") )
+        fEquilInit(idx, forceDensity) ) )
     
 #%% Define BCs
 
@@ -185,14 +184,10 @@ dbcBottom = dune.ufl.DirichletBC(V, u_D, x[1] < 1e-8)
 dbcTop = dune.ufl.DirichletBC(V, u_D, abs(L_y - x[1]) <  1e-8 )
 
 bottomFn = V.interpolate(
-    lambda x: 1.0 if abs(x[1]) < 1e-8 else 0.0,
-    name="bottomFn"
-)
+    lambda x: 1.0 if abs(x[1]) < 1e-8 else 0.0, name="bottomFn")
 
 topFn = V.interpolate(
-    lambda x: 1.0 if abs(L_y - x[1]) < 1e-8 else 0.0,
-    name="topFn"
-)
+    lambda x: 1.0 if abs(L_y - x[1]) < 1e-8 else 0.0, name="topFn")
 
 bottomDoFs = np.where(bottomFn.as_numpy != 0)[0]
 topDoFs = np.where(topFn.as_numpy != 0)[0]
@@ -260,8 +255,8 @@ for idx in range(Q):
         
     sysMatColl.append(dune.fem.assemble(bilinFormsColl[idx]))
  
-rhsVecStreaming = [0]*Q
-rhsVecCollision = [0]*Q
+rhsVecStreaming = []
+rhsVecCollision = []
     
 sysMatCollNumpy = sysMatColl[0].as_numpy 
 collSolver = scipy.sparse.linalg.factorized(sysMatCollNumpy)
@@ -277,6 +272,19 @@ for idx in range(Q):
     f_n_arrays.append(f_n[idx].as_numpy)
     f_star_arrays.append(f_star[idx].as_numpy)
     
+collisionOps = []
+streamingOps = []
+for idx in range(Q):
+    collForm = linear_forms_collision[idx]
+    streamForm = linear_forms_stream[idx]
+    collisionOps.append( dune.fem.operator.galerkin(collForm - f_trial*v*ufl.dx) )
+    streamingOps.append( dune.fem.operator.galerkin(streamForm - f_trial*v*ufl.dx) )
+    
+    rhsVecCollision.append(V.zero.copy())
+    rhsVecStreaming.append(V.zero.copy())
+    
+    
+    
 
 vel_expr = getVel(f_n, forceDensity)
 
@@ -290,9 +298,7 @@ u_exact_expr = u_max * (
 )
 
 u_exact = V.interpolate(
-    u_exact_expr,
-    name="u_exact"
-)
+    u_exact_expr)
 
 ux = V.interpolate(0, name='ux')
 
@@ -307,7 +313,6 @@ print("time to enter time loop:", about_to_enter_loop_time - absolute_start_time
 t = 0.0
 print("about to enter time loop \n\n\n")
 for n in range(numSteps):
-    start_time = time.time()
     t += dt
     
 
@@ -318,19 +323,18 @@ for n in range(numSteps):
 
     velSquared = ufl.inner(velocity, velocity)
     densVelTimeEnd = time.time()
-    print("time to make ufl forms for density, vel = ", densVelTimeEnd - densVelTimeStart)
+    #print("time to make ufl forms for density, vel = ", densVelTimeEnd - densVelTimeStart)
 
     collisionTimeStart = time.time()
     # Do collision
     for idx in range(Q):
-        rhsVecCollision[idx] = dune.fem.assemble(linear_forms_collision[idx],
-                                                 order=2)
+        collisionOps[idx](V.zero, rhsVecCollision[idx])
         
         b = rhsVecCollision[idx].as_numpy 
         
         f_star_arrays[idx][:] = collSolver(b)
     collisionTimeEnd = time.time()
-    print("collision time = ", collisionTimeEnd - collisionTimeStart)
+    #print("collision time = ", collisionTimeEnd - collisionTimeStart)
     
         
 
@@ -338,25 +342,24 @@ for n in range(numSteps):
         
         if (idx==2) or (idx==5) or (idx==6):
             streamAssembleTimeStart = time.time()
-            rhsVecStreaming[idx] = (dune.fem.assemble(linear_forms_stream[idx],
-                                                      order=2))
+            
+            streamingOps[idx](V.zero, rhsVecStreaming[idx])
             rhsVecStreaming[idx].as_numpy[bottomDoFs]\
                 = f_star[opp_idx[idx]].as_numpy[bottomDoFs]
             streamAssembleTimeEnd = time.time()
-            print("time to assemble streaming = ", streamAssembleTimeEnd - streamAssembleTimeStart, "\n\n")
+            #print("time to assemble streaming = ", streamAssembleTimeEnd - streamAssembleTimeStart, "\n\n")
                 
             b = rhsVecStreaming[idx].as_numpy
             
             streamSolveTimeStart = time.time()
             f_n_arrays[idx][:] = streamSolvers[idx](b)
             streamSolveTimeEnd = time.time()
-            print("time to solve streaming = ", streamSolveTimeEnd - streamSolveTimeStart)
+            #print("time to solve streaming = ", streamSolveTimeEnd - streamSolveTimeStart)
             
             
             
         elif (idx==4) or (idx == 7) or (idx==8):
-            rhsVecStreaming[idx] = (dune.fem.assemble(linear_forms_stream[idx],
-                                                      order=2))
+            streamingOps[idx](V.zero, rhsVecStreaming[idx])
             
             rhsVecStreaming[idx].as_numpy[topDoFs]\
                     = f_star[opp_idx[idx]].as_numpy[topDoFs]
@@ -367,8 +370,7 @@ for n in range(numSteps):
             
             
         else:
-            rhsVecStreaming[idx] = (dune.fem.assemble(linear_forms_stream[idx],
-                                                      order=2))
+            streamingOps[idx](V.zero, rhsVecStreaming[idx])
             b = rhsVecStreaming[idx].as_numpy
 
             f_n_arrays[idx][:] = streamSolvers[idx](b)
@@ -411,13 +413,6 @@ for n in range(numSteps):
                     
     
     if n % 1000 == 0:
-        
-        finish_time = time.time()
-        
-        
-        
-        print("iteration time = ", finish_time - start_time)
-        print("\n n = ", n, "writing to file \n\n")
         
         #ux = V.interpolate(ux_expr, name="ux")
         #uy = V.interpolate(uy_expr, name="uy")
