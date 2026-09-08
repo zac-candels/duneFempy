@@ -316,15 +316,6 @@ for n in range(numSteps):
     t += dt
     
 
-    densVelTimeStart = time.time()
-    density = getDens(f_n)
-
-    velocity = getVel(f_n, forceDensity)
-
-    velSquared = ufl.inner(velocity, velocity)
-    densVelTimeEnd = time.time()
-    #print("time to make ufl forms for density, vel = ", densVelTimeEnd - densVelTimeStart)
-
     collisionTimeStart = time.time()
     # Do collision
     for idx in range(Q):
@@ -412,7 +403,7 @@ for n in range(numSteps):
         #     )
                     
     
-    if n % 1000 == 0:
+    if n % 5000 == 0:
         
         #ux = V.interpolate(ux_expr, name="ux")
         #uy = V.interpolate(uy_expr, name="uy")
