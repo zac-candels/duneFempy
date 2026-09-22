@@ -11,7 +11,7 @@ import os
 import time
 
 WORKDIR = os.getcwd()
-outDirName = os.path.join(WORKDIR, "drop-spread")
+outDirName = os.path.join(WORKDIR, "drop-spread-bounceback-all-over")
 os.makedirs(outDirName, exist_ok=True)
 
 import ufl
@@ -48,15 +48,15 @@ Interval
 16.0 4.0
 60 20
 #
-PERIODICFACETRANSFORMATION
-1 0, 0 1 + 16 0
-#
 BOUNDARYDOMAIN
+1 0.0 0.0 0.0 4.0
+2 16.0 0.0 16.0 4.0
 3 0.0 0.0 16.0 0.0
 4 0.0 4.0 16.0 4.0
 default 1
 #
 """
+
 with open("periodic_box.dgf", "w") as f:
     f.write(dgf_text)
     
@@ -204,6 +204,10 @@ u_D = 1
 dbcBottom = dune.ufl.DirichletBC(V, u_D, x[1] < 1e-8)
 dbcTop = dune.ufl.DirichletBC(V, u_D, abs(L_y - x[1]) <  1e-8 )
 
+dbcLeft = dune.ufl.DirichletBC(V, u_D, x[0] < 1e-8)
+dbcRight = dune.ufl.DirichletBC(V, u_D, abs(L_x - x[0]) < 1e-8)
+
+
 bottomFn = V.interpolate(
     lambda x: 1.0 if abs(x[1]) < 1e-8 else 0.0,
     name="bottomFn"
@@ -216,6 +220,20 @@ topFn = V.interpolate(
 
 bottomDoFs = np.where(bottomFn.as_numpy != 0)[0]
 topDoFs = np.where(topFn.as_numpy != 0)[0]
+
+leftFn = V.interpolate(
+    lambda x: 1.0 if abs(x[0]) < 1e-8 else 0.0,
+    name="leftFn"
+)
+
+rightFn = V.interpolate(
+    lambda x: 1.0 if abs(L_x - x[0]) < 1e-8 else 0.0,
+    name="rightFn"
+)
+
+leftDoFs = np.where(leftFn.as_numpy != 0)[0]
+rightDoFs = np.where(rightFn.as_numpy != 0)[0]
+
     
 print("done making BCs\n\n")
 
@@ -287,16 +305,39 @@ print("finished making LB forms\n\n")
 sysMatStream = []
 sysMatColl = []
 for idx in range(Q):
-    #sysMatStream.append(dune.fem.assemble(bilinFormsStream[idx]))
-    if (idx == 0) or (idx == 1) or (idx == 3):
-        sysMatStream.append(dune.fem.assemble(bilinFormsStream[idx]))
-    elif (idx == 5) or (idx == 2) or (idx == 6):
-        sysMatStream.append(dune.fem.assemble([bilinFormsStream[idx], dbcBottom]))
-    elif (idx== 4) or (idx == 7) or (idx == 8) :
-        sysMatStream.append(dune.fem.assemble([bilinFormsStream[idx], dbcTop]))
-        
-    sysMatColl.append(dune.fem.assemble(bilinFormsColl[idx]))
- 
+
+    # No wall BC for rest population
+    if idx == 0:
+        sysMatStream.append(
+            dune.fem.assemble(bilinFormsStream[idx])
+        )
+
+    # Populations pointing toward bottom wall
+    elif idx in (2, 5, 6):
+        sysMatStream.append(
+            dune.fem.assemble([bilinFormsStream[idx], dbcBottom])
+        )
+
+    # Populations pointing toward top wall
+    elif idx in (4, 7, 8):
+        sysMatStream.append(
+            dune.fem.assemble([bilinFormsStream[idx], dbcTop])
+        )
+
+    # Population pointing toward right wall
+    elif idx in (1, 5, 8):
+        sysMatStream.append(
+            dune.fem.assemble([bilinFormsStream[idx], dbcRight])
+        )
+
+    # Population pointing toward left wall
+    elif idx in (3, 6, 7):
+        sysMatStream.append(
+            dune.fem.assemble([bilinFormsStream[idx], dbcLeft])
+        )
+
+sysMatColl = dune.fem.assemble(bilinFormsColl[0])
+
 rhsVecStreaming = []
 rhsVecCollision = []
 
@@ -319,7 +360,7 @@ rhs_Mu_fn = V.zero.copy()
     
     
     
-sysMatCollNumpy = sysMatColl[0].as_numpy 
+sysMatCollNumpy = sysMatColl.as_numpy 
 collSolver = scipy.sparse.linalg.factorized(sysMatCollNumpy)
 
 streamSolvers = []
@@ -354,43 +395,36 @@ for n in range(numSteps):
     #print("did collision \n\n")
         
     #print("about to start streaming")
+    
+    bottom_idx = (2, 5, 6)
+    top_idx    = (4, 7, 8)
+    left_idx   = (3, 6, 7)
+    right_idx  = (1, 5, 8)
+    
     for idx in range(Q):
-        
-        if (idx==2) or (idx==5) or (idx==6):
-            streamAssembleTimeStart = time.time()
-            
-            streamingOps[idx](V.zero, rhsVecStreaming[idx])
-            rhsVecStreaming[idx].as_numpy[bottomDoFs]\
-                = f_star[opp_idx[idx]].as_numpy[bottomDoFs]
-            streamAssembleTimeEnd = time.time()
-            #print("time to assemble streaming = ", streamAssembleTimeEnd - streamAssembleTimeStart, "\n\n")
-                
-            b = rhsVecStreaming[idx].as_numpy
-            
-            streamSolveTimeStart = time.time()
-            f_n_arrays[idx][:] = streamSolvers[idx](b)
-            streamSolveTimeEnd = time.time()
-            #print("time to solve streaming = ", streamSolveTimeEnd - streamSolveTimeStart)
-            
-            
-            
-        elif (idx==4) or (idx == 7) or (idx==8):
-            streamingOps[idx](V.zero, rhsVecStreaming[idx])
-            
-            rhsVecStreaming[idx].as_numpy[topDoFs]\
-                    = f_star[opp_idx[idx]].as_numpy[topDoFs]
-                    
-            b = rhsVecStreaming[idx].as_numpy
-            
-            f_n_arrays[idx][:] = streamSolvers[idx](b)
-            
-            
-        else:
-            streamingOps[idx](V.zero, rhsVecStreaming[idx])
-            b = rhsVecStreaming[idx].as_numpy
-
-            f_n_arrays[idx][:] = streamSolvers[idx](b)
-            
+    
+        streamingOps[idx](V.zero, rhsVecStreaming[idx])
+    
+        b = rhsVecStreaming[idx].as_numpy
+    
+        # Bottom wall: bounce back populations
+        if idx in bottom_idx:
+            b[bottomDoFs] = f_star[opp_idx[idx]].as_numpy[bottomDoFs]
+    
+        # Top wall: bounce back populations
+        if idx in top_idx:
+            b[topDoFs] = f_star[opp_idx[idx]].as_numpy[topDoFs]
+    
+        # Left wall: bounce back populations
+        if idx in left_idx:
+            b[leftDoFs] = f_star[opp_idx[idx]].as_numpy[leftDoFs]
+    
+        # Right wall: bounce back populations
+        if idx in right_idx:
+            b[rightDoFs] = f_star[opp_idx[idx]].as_numpy[rightDoFs]
+    
+        f_n_arrays[idx][:] = streamSolvers[idx](b)
+              
           
     #print("about to solve for phi, mu")
     phi_nP1.as_numpy[:] = collSolver(rhs_AC_fn.as_numpy)
@@ -401,6 +435,31 @@ for n in range(numSteps):
     
     mass_n = dune.fem.integrate((phi_n + 1) / 2)
     mass_diff.assign( mass_n - mass_init )
+    print("mass_n = ", mass_n)
+    
+    phi_a = phi_n.as_numpy
+
+    mass_error = mass_n - mass_init
+
+    print(
+        "phi finite:",
+        np.isfinite(phi_a).all(),
+        "min:", np.nanmin(phi_a),
+        "max:", np.nanmax(phi_a),
+        "nan:", np.isnan(phi_a).sum(),
+        "inf:", np.isinf(phi_a).sum()
+    )
+        
+    mass_diff.assign(mass_error)
+    
+    print("mass_error =", repr(mass_error))
+    print("type       =", type(mass_error))
+    print("isNumber   =", dune.ufl.isNumber(mass_error))
+    print("float      =", float(mass_error))
+    print("isNumber(float) =", dune.ufl.isNumber(float(mass_error)))
+    
+    mass_diff.assign(mass_error)
+
     
     if n % 100 == 0:
         
