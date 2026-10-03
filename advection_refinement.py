@@ -53,7 +53,7 @@ print("Initial cells:", mesh.size(0))
 # Initial condition
 def initial_condition(x):
 
-    return 1.0 - ufl.exp(-1.0 / (8.0 * ( (x[0] - 1.0)**2 + (x[1] - 1.0)**2) ) )
+    return 1.0 - ufl.exp(-1.0 / (4.0 * ( (x[0] - 1.0)**2 + (x[1] - 1.0)**2) ) )
 
 
 # Fn. to build every object that depends on the mesh - ie function space,

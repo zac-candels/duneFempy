@@ -1,3 +1,7 @@
+import os
+os.environ["DUNE_LOG_LEVEL"] = "warning"
+
+
 from scipy.sparse import linalg
 from math import sqrt
 import matplotlib.pyplot as plt
@@ -11,7 +15,7 @@ import os
 import time
 
 WORKDIR = os.getcwd()
-outDirName = os.path.join(WORKDIR, "drop-spread")
+outDirName = os.path.join(WORKDIR, "drop-spread-periodic2")
 os.makedirs(outDirName, exist_ok=True)
 
 import ufl
@@ -184,149 +188,506 @@ opp_idx = {0: 0, 1: 3, 2: 4, 3: 1, 4: 2, 5: 7, 6: 8, 7: 5, 8: 6}
     
 def build_system(mesh, f_n, f_star, phi_n, mu_n):
 
-    # Finite element space
-    fnSpace = dune.fem.space.lagrange(mesh, order=1)
-    V_vec3 = dune.fem.space.lagrange(mesh, order=1, dimRange=3)
-    vel3 = V_vec3.interpolate(dune.ufl.Constant((0, 0, 0)), name="vel")
+    # =====================================================
+    # Finite element spaces
+    # =====================================================
+
+    fnSpace = dune.fem.space.lagrange(
+        mesh,
+        order=1
+    )
+
+    V_vec3 = dune.fem.space.lagrange(
+        mesh,
+        order=1,
+        dimRange=3
+    )
+
+    vel3 = V_vec3.interpolate(
+        dune.ufl.Constant((0, 0, 0)),
+        name="vel"
+    )
+
     x = ufl.SpatialCoordinate(fnSpace)
 
-    u_D = 1
-    
-    dbcBottom = dune.ufl.DirichletBC(fnSpace, u_D, x[1] < 1e-8)
-    dbcTop = dune.ufl.DirichletBC(fnSpace, u_D, abs(L_y - x[1]) <  1e-8 )
-    
-    bottomFn = fnSpace.interpolate(
-        lambda x: 1.0 if abs(x[1]) < 1e-8 else 0.0, name="bottomFn")
-    
-    topFn = fnSpace.interpolate(
-        lambda x: 1.0 if abs(L_y - x[1]) < 1e-8 else 0.0, name="topFn")
-    
-    bottomDoFs = np.where(bottomFn.as_numpy != 0)[0]
-    topDoFs = np.where(topFn.as_numpy != 0)[0]
+    # =====================================================
+    # Dirichlet boundary conditions
+    #
+    # These are retained at y=0 and y=L_y.
+    # x is periodic.
+    # =====================================================
 
+    u_D = 1
+
+    dbcBottom = dune.ufl.DirichletBC(
+        fnSpace,
+        u_D,
+        x[1] < 1e-8
+    )
+
+    dbcTop = dune.ufl.DirichletBC(
+        fnSpace,
+        u_D,
+        abs(L_y - x[1]) < 1e-8
+    )
+
+    bottomFn = fnSpace.interpolate(
+        lambda x: 1.0 if abs(x[1]) < 1e-8 else 0.0,
+        name="bottomFn"
+    )
+
+    topFn = fnSpace.interpolate(
+        lambda x: 1.0 if abs(L_y - x[1]) < 1e-8 else 0.0,
+        name="topFn"
+    )
+
+    bottomDoFs = np.where(
+        bottomFn.as_numpy != 0
+    )[0]
+
+    topDoFs = np.where(
+        topFn.as_numpy != 0
+    )[0]
+
+    # =====================================================
     # UFL objects
+    # =====================================================
+
     trialFn = ufl.TrialFunction(fnSpace)
     v = ufl.TestFunction(fnSpace)
 
-    x = ufl.SpatialCoordinate(fnSpace)
+    # =====================================================
+    # Physical quantities
+    # =====================================================
 
+    density = getDens(f_n)
+
+    velocity_n = getVel(
+        f_n,
+        forceDensity
+    )
+
+    velStar_n = getVel(
+        f_star,
+        forceDensity
+    )
+
+    velSquared = ufl.inner(
+        velocity_n,
+        velocity_n
+    )
+
+    # =====================================================
+    # Allen-Cahn equation
+    # =====================================================
+
+    lin_form_AC = (
+        phi_n * v * ufl.dx
+        - dt * v
+        * ufl.dot(
+            velocity_n,
+            ufl.grad(phi_n)
+        ) * ufl.dx
+        - dt * M_tilde * v * mu_n * ufl.dx
+        - (beta_mass_diff / dt)
+        * mass_diff
+        * ufl.sqrt(
+            ufl.dot(
+                ufl.grad(phi_n),
+                ufl.grad(phi_n)
+            )
+        )
+        * v * ufl.dx
+        - 0.5 * dt**2
+        * ufl.dot(
+            velocity_n,
+            ufl.grad(v)
+        )
+        * ufl.dot(
+            velocity_n,
+            ufl.grad(phi_n)
+        )
+        * ufl.dx
+    )
+
+    # =====================================================
+    # Chemical potential
+    # =====================================================
+
+    lin_form_mu = (
+        A * phi_n * (phi_n**2 - 1) * v * ufl.dx
+        + kappa
+        * ufl.dot(
+            ufl.grad(phi_n),
+            ufl.grad(v)
+        ) * ufl.dx
+        + kappa
+        / (np.sqrt(2) * interfaceThickness)
+        * np.cos(theta)
+        * (phi_n**2 - 1)
+        * v
+        * ufl.ds(3)
+    )
+
+    # =====================================================
+    # LBM forms
+    # =====================================================
 
     bilinFormsStream = []
-    linear_forms_stream = []
-    
     bilinFormsColl = []
+
+    linear_forms_stream = []
     linear_forms_collision = []
-    
-    density = getDens(f_n)
-    velocity_n = getVel(f_n, forceDensity)
-    velStar_n = getVel(f_star, forceDensity)
-    velSquared = ufl.inner(velocity_n, velocity_n)
-
-    #print("about to start making AC forms \n\n")
-
-    lin_form_AC = phi_n * v * ufl.dx - dt*v*ufl.dot(velocity_n, ufl.grad(phi_n))*ufl.dx\
-        - dt*M_tilde*v*mu_n*ufl.dx - (beta_mass_diff/dt)*mass_diff*ufl.sqrt( ufl.dot(ufl.grad(phi_n), ufl.grad(phi_n)) )*v*ufl.dx\
-            - 0.5*dt**2 * ufl.dot(velocity_n, ufl.grad(v)) * ufl.dot(velocity_n, ufl.grad(phi_n)) *ufl.dx
-
-    lin_form_mu =  A* phi_n*(phi_n**2 - 1)*v*ufl.dx\
-        + kappa*ufl.dot(ufl.grad(phi_n),ufl.grad(v))*ufl.dx\
-            + kappa/(np.sqrt(2)*interfaceThickness)*np.cos(theta)*(phi_n**2-1)*v*ufl.ds(3)
-
-    #print("finished making AC forms \n\n")
 
     for idx in range(Q):
 
-        bilinFormsStream.append(trialFn * v * ufl.dx)
-        bilinFormsColl.append(trialFn*v*ufl.dx)
+        bilinFormsStream.append(
+            trialFn * v * ufl.dx
+        )
 
-        double_dot_product_term = -0.5*dt**2 * ufl.inner(xi[idx], ufl.grad(f_star[idx]))\
-            * ufl.inner(xi[idx], ufl.grad(v)) * ufl.dx
+        bilinFormsColl.append(
+            trialFn * v * ufl.dx
+        )
 
-        dot_product_force_term = 0.5*dt**2 * ufl.inner(xi[idx], ufl.grad(v))\
-            * body_Force(velStar_n, idx, forceDensity) * ufl.dx
+        double_dot_product_term = (
+            -0.5 * dt**2
+            * ufl.inner(
+                xi[idx],
+                ufl.grad(f_star[idx])
+            )
+            * ufl.inner(
+                xi[idx],
+                ufl.grad(v)
+            )
+            * ufl.dx
+        )
 
+        dot_product_force_term = (
+            0.5 * dt**2
+            * ufl.inner(
+                xi[idx],
+                ufl.grad(v)
+            )
+            * body_Force(
+                velStar_n,
+                idx,
+                forceDensity
+            )
+            * ufl.dx
+        )
 
-        lin_form_idx = f_star[idx]*v*ufl.dx\
-            - dt*v*ufl.inner(xi[idx], ufl.grad(f_star[idx]))*ufl.dx\
-            + dt*v*body_Force(velStar_n, idx, forceDensity)*ufl.dx\
-            + double_dot_product_term\
+        lin_form_idx = (
+            f_star[idx] * v * ufl.dx
+            - dt
+            * v
+            * ufl.inner(
+                xi[idx],
+                ufl.grad(f_star[idx])
+            )
+            * ufl.dx
+            + dt
+            * v
+            * body_Force(
+                velStar_n,
+                idx,
+                forceDensity
+            )
+            * ufl.dx
+            + double_dot_product_term
             + dot_product_force_term
-            
+        )
+
         f_eq_idx = f_equil(
             idx,
             velocity_n,
             density,
-            velSquared)
-            
-        lin_form_coll = (f_n[idx] - dt/(tau) * (f_n[idx] - f_eq_idx) )*v*ufl.dx
+            velSquared
+        )
 
-        linear_forms_stream.append(lin_form_idx)
-        linear_forms_collision.append(lin_form_coll)
-        
-    #print("finished making LB forms\n\n")
+        lin_form_coll = (
+            f_n[idx]
+            - dt / tau
+            * (f_n[idx] - f_eq_idx)
+        ) * v * ufl.dx
 
-    # Assemble matrices for first step
+        linear_forms_stream.append(
+            lin_form_idx
+        )
+
+        linear_forms_collision.append(
+            lin_form_coll
+        )
+
+    # =====================================================
+    # PERIODIC DOF MAP
+    # =====================================================
+
+    x_dof = fnSpace.interpolate(
+        x[0],
+        name="x_dof"
+    ).as_numpy.copy()
+
+    y_dof = fnSpace.interpolate(
+        x[1],
+        name="y_dof"
+    ).as_numpy.copy()
+
+    N = len(x_dof)
+
+    # -----------------------------------------------------
+    # x periodicity only
+    # -----------------------------------------------------
+
+    x_periodic = x_dof.copy()
+
+    x_periodic[
+        np.abs(x_periodic - L_x) < 1e-10
+    ] = 0.0
+
+    # -----------------------------------------------------
+    # y is NOT periodic
+    # -----------------------------------------------------
+
+    keys = np.column_stack((
+        np.round(x_periodic, 10),
+        np.round(y_dof, 10)
+    ))
+
+    unique_keys, inverse = np.unique(
+        keys,
+        axis=0,
+        return_inverse=True
+    )
+
+    nPeriodic = len(unique_keys)
+
+    rows = np.arange(N)
+    cols = inverse
+    data = np.ones(N)
+
+    P = scipy.sparse.coo_matrix(
+        (data, (rows, cols)),
+        shape=(N, nPeriodic)
+    ).tocsr()
+
+    # print(
+    #     "Full DOFs:",
+    #     N,
+    #     "Periodic DOFs:",
+    #     nPeriodic
+    # )
+
+    # =====================================================
+    # Assemble matrices
+    # =====================================================
+
     sysMatStream = []
     sysMatColl = []
+
     for idx in range(Q):
-        #sysMatStream.append(dune.fem.assemble(bilinFormsStream[idx]))
-        if (idx == 0) or (idx == 1) or (idx == 3):
-            sysMatStream.append(dune.fem.assemble(bilinFormsStream[idx]))
-        elif (idx == 5) or (idx == 2) or (idx == 6):
-            sysMatStream.append(dune.fem.assemble([bilinFormsStream[idx], dbcBottom]))
-        elif (idx== 4) or (idx == 7) or (idx == 8) :
-            sysMatStream.append(dune.fem.assemble([bilinFormsStream[idx], dbcTop]))
-            
-        sysMatColl.append(dune.fem.assemble(bilinFormsColl[idx]))
-     
-    rhsVecStreaming = []
-    rhsVecCollision = []
+
+        # ---------------------------------------------
+        # Streaming matrix
+        # ---------------------------------------------
+
+        if idx in (0, 1, 3):
+
+            A_stream = dune.fem.assemble(
+                bilinFormsStream[idx]
+            )
+
+        elif idx in (5, 2, 6):
+
+            A_stream = dune.fem.assemble(
+                [
+                    bilinFormsStream[idx],
+                    dbcBottom
+                ]
+            )
+
+        elif idx in (4, 7, 8):
+
+            A_stream = dune.fem.assemble(
+                [
+                    bilinFormsStream[idx],
+                    dbcTop
+                ]
+            )
+
+        # ---------------------------------------------
+        # Collision matrix
+        # ---------------------------------------------
+
+        A_coll = dune.fem.assemble(
+            bilinFormsColl[idx]
+        )
+
+        # ---------------------------------------------
+        # PERIODIC REDUCTION
+        # ---------------------------------------------
+
+        A_stream_periodic = (
+            P.T
+            @ scipy.sparse.csr_matrix(
+                A_stream.as_numpy
+            )
+            @ P
+        ).tocsc()
+
+        A_coll_periodic = (
+            P.T
+            @ scipy.sparse.csr_matrix(
+                A_coll.as_numpy
+            )
+            @ P
+        ).tocsc()
+
+        sysMatStream.append(
+            A_stream_periodic
+        )
+
+        sysMatColl.append(
+            A_coll_periodic
+        )
+
+    # =====================================================
+    # Factorizations
+    # =====================================================
+
+    # Collision matrix is identical for all directions,
+    # so one factorization is sufficient.
+    collSolver = scipy.sparse.linalg.factorized(
+        sysMatColl[0]
+    )
+
+    streamSolvers = []
+
+    for idx in range(Q):
+
+        streamSolvers.append(
+            scipy.sparse.linalg.factorized(
+                sysMatStream[idx]
+            )
+        )
+
+    # =====================================================
+    # Operators
+    # =====================================================
 
     collisionOps = []
     streamingOps = []
+
     for idx in range(Q):
+
         collForm = linear_forms_collision[idx]
         streamForm = linear_forms_stream[idx]
-        collisionOps.append( dune.fem.operator.galerkin(collForm - trialFn*v*ufl.dx) )
-        streamingOps.append( dune.fem.operator.galerkin(streamForm - trialFn*v*ufl.dx) )
-        
-        rhsVecCollision.append(fnSpace.zero.copy())
-        rhsVecStreaming.append(fnSpace.zero.copy())
 
-    phi_form_op = dune.fem.operator.galerkin(lin_form_AC - trialFn*v*ufl.dx)
-    mu_form_op = dune.fem.operator.galerkin(lin_form_mu - trialFn*v*ufl.dx)
+        collisionOps.append(
+            dune.fem.operator.galerkin(
+                collForm
+                - trialFn * v * ufl.dx
+            )
+        )
+
+        streamingOps.append(
+            dune.fem.operator.galerkin(
+                streamForm
+                - trialFn * v * ufl.dx
+            )
+        )
+
+    # =====================================================
+    # AC / chemical potential operators
+    # =====================================================
+
+    phi_form_op = dune.fem.operator.galerkin(
+        lin_form_AC
+        - trialFn * v * ufl.dx
+    )
+
+    mu_form_op = dune.fem.operator.galerkin(
+        lin_form_mu
+        - trialFn * v * ufl.dx
+    )
+
+    # =====================================================
+    # RHS storage
+    # =====================================================
+
+    rhsVecCollision = []
+
+    rhsVecStreaming = []
+
+    for idx in range(Q):
+
+        rhsVecCollision.append(
+            fnSpace.zero.copy()
+        )
+
+        rhsVecStreaming.append(
+            fnSpace.zero.copy()
+        )
+
     rhs_AC_fn = fnSpace.zero.copy()
     rhs_Mu_fn = fnSpace.zero.copy()
-        
-        
-        
-    sysMatCollNumpy = sysMatColl[0].as_numpy 
-    collSolver = scipy.sparse.linalg.factorized(sysMatCollNumpy)
 
-    streamSolvers = []
+    # =====================================================
+    # Arrays containing the full DUNE DOFs
+    # =====================================================
+
     f_n_arrays = []
-    f_star_arrays= []
+    f_star_arrays = []
+
     for idx in range(Q):
-        sysMatStreamNumpy = sysMatStream[idx].as_numpy
-        streamSolvers.append(scipy.sparse.linalg.factorized(sysMatStreamNumpy))
-        f_n_arrays.append(f_n[idx].as_numpy)
-        f_star_arrays.append(f_star[idx].as_numpy)
 
+        f_n_arrays.append(
+            f_n[idx].as_numpy
+        )
 
-    return (fnSpace, vel3, bottomDoFs, topDoFs, phi_form_op, mu_form_op,
-            rhs_AC_fn, rhs_Mu_fn, collisionOps, streamingOps, 
-            collSolver, streamSolvers, rhsVecCollision, rhsVecStreaming,
-            f_n_arrays, f_star_arrays)
+        f_star_arrays.append(
+            f_star[idx].as_numpy
+        )
+
+    # =====================================================
+    # Return everything
+    # =====================================================
+
+    return (
+        fnSpace,
+        vel3,
+        bottomDoFs,
+        topDoFs,
+        P,
+        phi_form_op,
+        mu_form_op,
+        rhs_AC_fn,
+        rhs_Mu_fn,
+        collisionOps,
+        streamingOps,
+        collSolver,
+        streamSolvers,
+        rhsVecCollision,
+        rhsVecStreaming,
+        f_n_arrays,
+        f_star_arrays
+    )
     
     
     
-(V, vel3, bottomDoFs, topDoFs, phi_form_op, mu_form_op,
-        rhs_AC_fn, rhs_Mu_fn, collisionOps, streamingOps, 
-        collSolver, streamSolvers, rhsVecCollision, rhsVecStreaming,
-        f_n_arrays, f_star_arrays) = build_system(mesh, f_n, f_star, phi_n, mu_n)    
-    
-    
-    
+(V, vel3, bottomDoFs, topDoFs,
+ P,
+ phi_form_op, mu_form_op,
+ rhs_AC_fn, rhs_Mu_fn,
+ collisionOps, streamingOps,
+ collSolver, streamSolvers,
+ rhsVecCollision, rhsVecStreaming,
+ f_n_arrays, f_star_arrays) = build_system(
+     mesh,
+     f_n,
+     f_star,
+     phi_n,
+     mu_n
+ )
     
     
     
@@ -334,106 +695,270 @@ def build_system(mesh, f_n, f_star, phi_n, mu_n):
     
 #%% Time loop
 #rint("about to start time-stepping\n\n")
+# ============================================================
+# Time loop
+# ============================================================
+
 for n in range(numSteps):
 
-    phi_form_op(V.zero, rhs_AC_fn)
-    mu_form_op(V.zero, rhs_Mu_fn)
-    
-    #print("assembled rhs vecs for phi, mu \n\n")
+    # ========================================================
+    # Assemble Allen-Cahn and chemical-potential RHS
+    # ========================================================
 
-    
-    # Do collision
-    for idx in range(Q):
-        collisionOps[idx](V.zero, rhsVecCollision[idx])
-        
-        b = rhsVecCollision[idx].as_numpy 
-        
-        f_star_arrays[idx][:] = collSolver(b)
-    
-    #print("did collision \n\n")
-        
-    #print("about to start streaming")
-    for idx in range(Q):
-        
-        if (idx==2) or (idx==5) or (idx==6):
-            streamAssembleTimeStart = time.time()
-            
-            streamingOps[idx](V.zero, rhsVecStreaming[idx])
-            rhsVecStreaming[idx].as_numpy[bottomDoFs]\
-                = f_star[opp_idx[idx]].as_numpy[bottomDoFs]
-            streamAssembleTimeEnd = time.time()
-            #print("time to assemble streaming = ", streamAssembleTimeEnd - streamAssembleTimeStart, "\n\n")
-                
-            b = rhsVecStreaming[idx].as_numpy
-            
-            streamSolveTimeStart = time.time()
-            f_n_arrays[idx][:] = streamSolvers[idx](b)
-            streamSolveTimeEnd = time.time()
-            #print("time to solve streaming = ", streamSolveTimeEnd - streamSolveTimeStart)
-            
-            
-            
-        elif (idx==4) or (idx == 7) or (idx==8):
-            streamingOps[idx](V.zero, rhsVecStreaming[idx])
-            
-            rhsVecStreaming[idx].as_numpy[topDoFs]\
-                    = f_star[opp_idx[idx]].as_numpy[topDoFs]
-                    
-            b = rhsVecStreaming[idx].as_numpy
-            
-            f_n_arrays[idx][:] = streamSolvers[idx](b)
-            
-            
-        else:
-            streamingOps[idx](V.zero, rhsVecStreaming[idx])
-            b = rhsVecStreaming[idx].as_numpy
+    phi_form_op(
+        V.zero,
+        rhs_AC_fn
+    )
 
-            f_n_arrays[idx][:] = streamSolvers[idx](b)
-            
-          
-    #print("about to solve for phi, mu")
-    phi_nP1.as_numpy[:] = collSolver(rhs_AC_fn.as_numpy)
-    mu_n.as_numpy[:] = collSolver(rhs_Mu_fn.as_numpy)
-    
-    phi_n.assign(phi_nP1)
-    
-    
-    mass_n = dune.fem.integrate((phi_n + 1) / 2)
-    mass_diff.assign( mass_n - mass_init )
-    
+    mu_form_op(
+        V.zero,
+        rhs_Mu_fn
+    )
+
+    # ========================================================
+    # COLLISION
+    # ========================================================
+
+    for idx in range(Q):
+
+        collisionOps[idx](
+            V.zero,
+            rhsVecCollision[idx]
+        )
+
+        # ----------------------------------------------
+        # Full RHS
+        # ----------------------------------------------
+
+        b_full = rhsVecCollision[idx].as_numpy
+
+        # ----------------------------------------------
+        # Periodic RHS
+        #
+        # b_p = P.T b
+        # ----------------------------------------------
+
+        b_periodic = P.T @ b_full
+
+        # ----------------------------------------------
+        # Solve reduced system
+        # ----------------------------------------------
+
+        f_star_periodic = collSolver(
+            b_periodic
+        )
+
+        # ----------------------------------------------
+        # Expand back to full DOFs
+        #
+        # f_full = P f_periodic
+        # ----------------------------------------------
+
+        f_star_arrays[idx][:] = (
+            P @ f_star_periodic
+        )
+
+    # ========================================================
+    # STREAMING
+    # ========================================================
+
+    for idx in range(Q):
+
+        streamingOps[idx](
+            V.zero,
+            rhsVecStreaming[idx]
+        )
+
+        # ----------------------------------------------
+        # Full RHS
+        # ----------------------------------------------
+
+        b_full = rhsVecStreaming[idx].as_numpy
+
+        # ----------------------------------------------
+        # Boundary condition at bottom
+        # ----------------------------------------------
+
+        if idx in (2, 5, 6):
+
+            b_full[bottomDoFs] = (
+                f_star[opp_idx[idx]]
+                .as_numpy[bottomDoFs]
+            )
+
+        # ----------------------------------------------
+        # Boundary condition at top
+        # ----------------------------------------------
+
+        elif idx in (4, 7, 8):
+
+            b_full[topDoFs] = (
+                f_star[opp_idx[idx]]
+                .as_numpy[topDoFs]
+            )
+
+        # ----------------------------------------------
+        # Periodic reduction
+        # ----------------------------------------------
+
+        b_periodic = P.T @ b_full
+
+        # ----------------------------------------------
+        # Solve
+        # ----------------------------------------------
+
+        f_n_periodic = streamSolvers[idx](
+            b_periodic
+        )
+
+        # ----------------------------------------------
+        # Expand solution
+        # ----------------------------------------------
+
+        f_n_arrays[idx][:] = (
+            P @ f_n_periodic
+        )
+
+    # ========================================================
+    # Solve Allen-Cahn equation
+    # ========================================================
+
+    b_phi_full = rhs_AC_fn.as_numpy
+
+    b_phi_periodic = P.T @ b_phi_full
+
+    phi_periodic = collSolver(
+        b_phi_periodic
+    )
+
+    phi_nP1.as_numpy[:] = (
+        P @ phi_periodic
+    )
+
+    # ========================================================
+    # Solve chemical potential
+    # ========================================================
+
+    b_mu_full = rhs_Mu_fn.as_numpy
+
+    b_mu_periodic = P.T @ b_mu_full
+
+    mu_periodic = collSolver(
+        b_mu_periodic
+    )
+
+    mu_n.as_numpy[:] = (
+        P @ mu_periodic
+    )
+
+    # ========================================================
+    # Update phi
+    # ========================================================
+
+    phi_n.assign(
+        phi_nP1
+    )
+
+    # ========================================================
+    # Mass correction
+    # ========================================================
+
+    mass_n = dune.fem.integrate(
+        (phi_n + 1) / 2
+    )
+
+    mass_diff.assign(
+        mass_n - mass_init
+    )
+
+    # ========================================================
+    # Mesh adaptation
+    # ========================================================
+
     if n % 20 == 0:
-        
+
         marker = dune.fem.GridMarker(
             1 - phi_n**2,
             refineTolerance=0.8,
             coarsenTolerance=0.2,
             minLevel=0,
-            maxLevel=3)
+            maxLevel=3
+        )
 
-        # ----------------------------------------------------
-        # Adapt the mesh.
-        #
-        # Passing u_n here makes DUNE transfer the solution
-        # to the new mesh.
-        # ----------------------------------------------------
+        dune.fem.gridAdapt(
+            marker,
+            f_n
+            + f_star
+            + [phi_n, mu_n]
+        )
 
-        dune.fem.gridAdapt(marker, f_n + f_star + [phi_n, mu_n])
-        
-        (V, vel3, bottomDoFs, topDoFs, phi_form_op, mu_form_op,
-                rhs_AC_fn, rhs_Mu_fn, collisionOps, streamingOps, 
-                collSolver, streamSolvers, rhsVecCollision, rhsVecStreaming,
-                f_n_arrays, f_star_arrays) = build_system(mesh, f_n, f_star, phi_n, mu_n)  
-    
+        # IMPORTANT:
+        # build_system() reconstructs P and all
+        # periodic matrices after mesh adaptation.
+
+        (
+            V,
+            vel3,
+            bottomDoFs,
+            topDoFs,
+            P,
+            phi_form_op,
+            mu_form_op,
+            rhs_AC_fn,
+            rhs_Mu_fn,
+            collisionOps,
+            streamingOps,
+            collSolver,
+            streamSolvers,
+            rhsVecCollision,
+            rhsVecStreaming,
+            f_n_arrays,
+            f_star_arrays
+        ) = build_system(
+            mesh,
+            f_n,
+            f_star,
+            phi_n,
+            mu_n
+        )
+
+    # ========================================================
+    # Output
+    # ========================================================
+
     if n % 100 == 0:
-        
-        print("n = ", n, "writing to file \n\n")
-        
-        vel_expr = getVel(f_n, forceDensity)
-        vel3.interpolate(ufl.as_vector([vel_expr[0], vel_expr[1], 0]))
 
-        mesh.writeVTK(os.path.join(outDirName, f"vel_{n:06d}"), pointdata=[vel3])
-        
-        mesh.writeVTK(os.path.join(outDirName, f"phi_{n:06d}"),
-            pointdata=[phi_n])
-    
-    
+        print(
+            "n = ",
+            n,
+            "writing to file\n"
+        )
+
+        vel_expr = getVel(
+            f_n,
+            forceDensity
+        )
+
+        vel3.interpolate(
+            ufl.as_vector([
+                vel_expr[0],
+                vel_expr[1],
+                0
+            ])
+        )
+
+        mesh.writeVTK(
+            os.path.join(
+                outDirName,
+                f"vel_{n:06d}"
+            ),
+            pointdata=[vel3]
+        )
+
+        mesh.writeVTK(
+            os.path.join(
+                outDirName,
+                f"phi_{n:06d}"
+            ),
+            pointdata=[phi_n]
+        )
