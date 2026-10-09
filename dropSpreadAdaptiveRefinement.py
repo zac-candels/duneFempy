@@ -57,6 +57,22 @@ domain = dune.grid.cartesianDomain(
 mesh = dune.fem.view.adaptiveLeafGridView(
     dune.alugrid.aluConformGrid(domain))
 
+h_min = np.inf
+
+for element in mesh.elements:
+    corners = np.asarray(element.geometry.corners)
+
+    h_element = max(
+        np.linalg.norm(a - b)
+        for i, a in enumerate(corners)
+        for b in corners[i + 1:]
+    )
+
+    h_min = min(h_min, h_element)
+
+h_min = h_min*2**3
+
+
 # Corresponding weights
 w = np.array([
     4/9,
@@ -185,6 +201,98 @@ for idx in range(Q):
         fEquilInit(idx),
         name=f"f_n{idx}") )
     
+
+# Function to evaluate FE function at a point 
+
+from dune.common import FieldVector
+
+def evaluate_at(u, gridView, point):
+    point = np.asarray(point, dtype=float)
+    local_u = u.localFunction()
+
+    for element in gridView.elements:
+        geometry = element.geometry
+        local_point = geometry.local(point)
+
+        if geometry.checkInside(local_point):
+            local_u.bind(element)
+            try:
+                return float(local_u(local_point))
+            finally:
+                local_u.unbind()
+
+    raise ValueError(f"Point {point} is outside the grid")
+
+
+
+
+# Function to compute contact angle 
+
+def computeContactAngle(c_n, Cn, mesh):
+
+    angles = []
+    n_vec = np.array([0.0, -1.0])
+
+    # Collect cell barycentres and order parameter values
+    nodal_dict = {}
+
+    for cell in mesh.elements:
+        geometry = cell.geometry
+        midpt = np.asarray(geometry.center)
+
+        coord = tuple(midpt)
+        value = float( evaluate_at(c_n, mesh, midpt) )
+
+        nodal_dict[coord] = value
+
+    # Keep points near the substrate
+    nodal_dict = {
+        coord: value
+        for coord, value in nodal_dict.items()
+        if coord[1] < 2 * 0.3
+    }
+
+    # Keep interfacial points
+    nodal_dict = {
+        coord: value
+        for coord, value in nodal_dict.items()
+        if -0.5 < value < 0.5
+    }
+
+
+    # Find the left-most interfacial point
+    min_x = min(coord[0] for coord in nodal_dict)
+
+    # Exclude points near the left contact line
+    nodal_dict = {
+        coord: value
+        for coord, value in nodal_dict.items()
+        if coord[0] > min_x + 5 * Cn
+    }
+
+    # Calculate contact angles
+    for coord in nodal_dict:
+        x = np.asarray(coord)
+
+        # Spatial gradient of the discrete function
+        grad_c = np.asarray(c_n.jacobian(x)).reshape(-1)
+
+        grad_norm = np.linalg.norm(grad_c)
+
+        if grad_norm < 1e-14:
+            continue
+
+        cos_theta = np.dot(grad_c, n_vec) / grad_norm
+
+        # Protect against floating-point roundoff
+        cos_theta = np.clip(cos_theta, -1.0, 1.0)
+
+        angles.append(np.arccos(cos_theta))
+
+
+    theta_avg = np.mean(angles) * 180.0 / np.pi
+
+    return theta_avg
 
     
 #%% Define BCs
@@ -658,6 +766,9 @@ for n in range(numSteps):
         #print("mass_diff type:", type(mass_diff))
         
         #print("mass_n type:", type(mass_n), "\n\n")
+        
+        theta_avg = computeContactAngle(phi_n, interfaceThickness, mesh)
+        print("theta = ", theta_avg)
         
         vel_expr = getVel(f_n, forceDensity)
         vel3.interpolate(ufl.as_vector([vel_expr[0], vel_expr[1], 0]))
